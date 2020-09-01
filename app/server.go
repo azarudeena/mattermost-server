@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/getsentry/sentry-go"
@@ -36,8 +38,6 @@ import (
 	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/mattermost/mattermost-server/v5/plugin"
 	"github.com/mattermost/mattermost-server/v5/services/cache"
-	"github.com/mattermost/mattermost-server/v5/services/cache/lru"
-	"github.com/mattermost/mattermost-server/v5/services/cache2"
 	"github.com/mattermost/mattermost-server/v5/services/filesstore"
 	"github.com/mattermost/mattermost-server/v5/services/httpservice"
 	"github.com/mattermost/mattermost-server/v5/services/imageproxy"
@@ -46,10 +46,13 @@ import (
 	"github.com/mattermost/mattermost-server/v5/services/searchengine/bleveengine"
 	"github.com/mattermost/mattermost-server/v5/services/timezones"
 	"github.com/mattermost/mattermost-server/v5/services/tracing"
+	"github.com/mattermost/mattermost-server/v5/services/upgrader"
 	"github.com/mattermost/mattermost-server/v5/store"
 	"github.com/mattermost/mattermost-server/v5/store/localcachelayer"
+	"github.com/mattermost/mattermost-server/v5/store/retrylayer"
 	"github.com/mattermost/mattermost-server/v5/store/searchlayer"
 	"github.com/mattermost/mattermost-server/v5/store/sqlstore"
+	"github.com/mattermost/mattermost-server/v5/store/timerlayer"
 	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
@@ -110,9 +113,9 @@ type Server struct {
 	newStore func() store.Store
 
 	htmlTemplateWatcher     *utils.HTMLTemplateWatcher
-	sessionCache            cache2.Cache
-	seenPendingPostIdsCache cache2.Cache
-	statusCache             cache2.Cache
+	sessionCache            cache.Cache
+	seenPendingPostIdsCache cache.Cache
+	statusCache             cache.Cache
 	configListenerId        string
 	licenseListenerId       string
 	logListenerId           string
@@ -122,6 +125,8 @@ type Server struct {
 	configStore             config.Store
 	asymmetricSigningKey    *ecdsa.PrivateKey
 	postActionCookieSecret  []byte
+
+	advancedLogListenerCleanup func()
 
 	pluginCommands     []*PluginCommand
 	pluginCommandsLock sync.RWMutex
@@ -161,8 +166,6 @@ type Server struct {
 
 	CacheProvider cache.Provider
 
-	CacheProvider2 cache2.Provider
-
 	tracer                      *tracing.Tracer
 	timestampLastDiagnosticSent time.Time
 }
@@ -195,21 +198,9 @@ func NewServer(options ...Option) (*Server, error) {
 		s.configStore = configStore
 	}
 
-	if s.Log == nil {
-		s.Log = mlog.NewLogger(utils.MloggerConfigFromLoggerConfig(&s.Config().LogSettings, utils.GetLogFileLocation))
+	if err := s.initLogging(); err != nil {
+		mlog.Error(err.Error())
 	}
-
-	if s.NotificationsLog == nil {
-		notificationLogSettings := utils.GetLogSettingsFromNotificationsLogSettings(&s.Config().NotificationLogSettings)
-		s.NotificationsLog = mlog.NewLogger(utils.MloggerConfigFromLoggerConfig(notificationLogSettings, utils.GetNotificationsLogFileLocation)).
-			WithCallerSkip(1).With(mlog.String("logSource", "notifications"))
-	}
-
-	// Redirect default golang logger to this logger
-	mlog.RedirectStdLog(s.Log)
-
-	// Use this app logger as the global logger (eventually remove all instances of global logging)
-	mlog.InitGlobalLogger(s.Log)
 
 	// It is important to initialize the hub only after the global logger is set
 	// to avoid race conditions while logging from inside the hub.
@@ -238,13 +229,6 @@ func NewServer(options ...Option) (*Server, error) {
 		s.tracer = tracer
 	}
 
-	s.logListenerId = s.AddConfigListener(func(_, after *model.Config) {
-		s.Log.ChangeLevels(utils.MloggerConfigFromLoggerConfig(&after.LogSettings, utils.GetLogFileLocation))
-
-		notificationLogSettings := utils.GetLogSettingsFromNotificationsLogSettings(&after.NotificationLogSettings)
-		s.NotificationsLog.ChangeLevels(utils.MloggerConfigFromLoggerConfig(notificationLogSettings, utils.GetNotificationsLogFileLocation))
-	})
-
 	s.HTTPService = httpservice.MakeHTTPService(s)
 	s.pushNotificationClient = s.HTTPService.MakeClient(true)
 
@@ -264,22 +248,18 @@ func NewServer(options ...Option) (*Server, error) {
 
 	// at the moment we only have this implementation
 	// in the future the cache provider will be built based on the loaded config
-	s.CacheProvider = new(lru.CacheProvider)
-
-	s.CacheProvider.Connect()
-
-	s.CacheProvider2 = cache2.NewProvider()
-	if err := s.CacheProvider2.Connect(); err != nil {
+	s.CacheProvider = cache.NewProvider()
+	if err := s.CacheProvider.Connect(); err != nil {
 		return nil, errors.Wrapf(err, "Unable to connect to cache provider")
 	}
 
-	s.sessionCache = s.CacheProvider2.NewCache(&cache2.CacheOptions{
+	s.sessionCache = s.CacheProvider.NewCache(&cache.CacheOptions{
 		Size: model.SESSION_CACHE_SIZE,
 	})
-	s.seenPendingPostIdsCache = s.CacheProvider2.NewCache(&cache2.CacheOptions{
+	s.seenPendingPostIdsCache = s.CacheProvider.NewCache(&cache.CacheOptions{
 		Size: PENDING_POST_IDS_CACHE_SIZE,
 	})
-	s.statusCache = s.CacheProvider2.NewCache(&cache2.CacheOptions{
+	s.statusCache = s.CacheProvider.NewCache(&cache.CacheOptions{
 		Size: model.STATUS_CACHE_SIZE,
 	})
 
@@ -317,10 +297,10 @@ func NewServer(options ...Option) (*Server, error) {
 			s.sqlStore = sqlstore.NewSqlSupplier(s.Config().SqlSettings, s.Metrics)
 			searchStore := searchlayer.NewSearchLayer(
 				localcachelayer.NewLocalCacheLayer(
-					s.sqlStore,
+					retrylayer.New(s.sqlStore),
 					s.Metrics,
 					s.Cluster,
-					s.CacheProvider2,
+					s.CacheProvider,
 				),
 				s.SearchEngine,
 				s.Config(),
@@ -335,7 +315,7 @@ func NewServer(options ...Option) (*Server, error) {
 				s.sqlStore.UpdateLicense(newLicense)
 			})
 
-			return store.NewTimerLayer(
+			return timerlayer.New(
 				searchStore,
 				s.Metrics,
 			)
@@ -416,6 +396,7 @@ func NewServer(options ...Option) (*Server, error) {
 		server:   s,
 		handlers: make(map[string]webSocketHandler),
 	}
+	s.WebSocketRouter.app = fakeApp
 
 	if appErr := mailservice.TestConnection(s.Config()); appErr != nil {
 		mlog.Error("Mail server connection test is failed: " + appErr.Message)
@@ -484,10 +465,25 @@ func NewServer(options ...Option) (*Server, error) {
 
 	s.ReloadConfig()
 
+	allowAdvancedLogging := license != nil && *license.Features.AdvancedLogging
+
 	if s.Audit == nil {
 		s.Audit = &audit.Audit{}
 		s.Audit.Init(audit.DefMaxQueueSize)
-		s.configureAudit(s.Audit)
+		if err = s.configureAudit(s.Audit, allowAdvancedLogging); err != nil {
+			mlog.Error("Error configuring audit", mlog.Err(err))
+		}
+	}
+
+	if !allowAdvancedLogging {
+		timeoutCtx, cancelCtx := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancelCtx()
+		mlog.Info("Shutting down advanced logging")
+		mlog.ShutdownAdvancedLogging(timeoutCtx)
+		if s.advancedLogListenerCleanup != nil {
+			s.advancedLogListenerCleanup()
+			s.advancedLogListenerCleanup = nil
+		}
 	}
 
 	// Enable developer settings if this is a "dev" build
@@ -495,8 +491,8 @@ func NewServer(options ...Option) (*Server, error) {
 		s.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.EnableDeveloper = true })
 	}
 
-	if appErr = s.Store.Status().ResetAll(); appErr != nil {
-		mlog.Error("Error to reset the server status.", mlog.Err(appErr))
+	if err = s.Store.Status().ResetAll(); err != nil {
+		mlog.Error("Error to reset the server status.", mlog.Err(err))
 	}
 
 	if s.startMetrics && s.Metrics != nil {
@@ -549,6 +545,78 @@ func (s *Server) AppOptions() []AppOption {
 	}
 }
 
+func (s *Server) initLogging() error {
+	if s.Log == nil {
+		s.Log = mlog.NewLogger(utils.MloggerConfigFromLoggerConfig(&s.Config().LogSettings, utils.GetLogFileLocation))
+	}
+
+	if s.NotificationsLog == nil {
+		notificationLogSettings := utils.GetLogSettingsFromNotificationsLogSettings(&s.Config().NotificationLogSettings)
+		s.NotificationsLog = mlog.NewLogger(utils.MloggerConfigFromLoggerConfig(notificationLogSettings, utils.GetNotificationsLogFileLocation)).
+			WithCallerSkip(1).With(mlog.String("logSource", "notifications"))
+	}
+
+	// Redirect default golang logger to this logger
+	mlog.RedirectStdLog(s.Log)
+
+	// Use this app logger as the global logger (eventually remove all instances of global logging)
+	mlog.InitGlobalLogger(s.Log)
+
+	s.logListenerId = s.AddConfigListener(func(_, after *model.Config) {
+		s.Log.ChangeLevels(utils.MloggerConfigFromLoggerConfig(&after.LogSettings, utils.GetLogFileLocation))
+
+		notificationLogSettings := utils.GetLogSettingsFromNotificationsLogSettings(&after.NotificationLogSettings)
+		s.NotificationsLog.ChangeLevels(utils.MloggerConfigFromLoggerConfig(notificationLogSettings, utils.GetNotificationsLogFileLocation))
+	})
+
+	// Configure advanced logging.
+	// Advanced logging is E20 only, however logging must be initialized before the license
+	// file is loaded.  If no valid E20 license exists then advanced logging will be
+	// shutdown once license is loaded/checked.
+	if *s.Config().LogSettings.AdvancedLoggingConfig != "" {
+		dsn := *s.Config().LogSettings.AdvancedLoggingConfig
+		isJson := config.IsJsonMap(dsn)
+
+		// If this is a file based config we need the full path so it can be watched.
+		if !isJson {
+			if fs, ok := s.configStore.(*config.FileStore); ok {
+				dsn = fs.GetFilePath(dsn)
+			}
+		}
+
+		cfg, err := config.NewLogConfigSrc(dsn, isJson, s.configStore)
+		if err != nil {
+			return fmt.Errorf("invalid advanced logging config, %w", err)
+		}
+
+		if err := mlog.ConfigAdvancedLogging(cfg.Get()); err != nil {
+			return fmt.Errorf("error configuring advanced logging, %w", err)
+		}
+
+		if !isJson {
+			mlog.Info("Loaded advanced logging config", mlog.String("source", dsn))
+		}
+
+		listenerId := cfg.AddListener(func(_, newCfg mlog.LogTargetCfg) {
+			if err := mlog.ConfigAdvancedLogging(newCfg); err != nil {
+				mlog.Error("Error re-configuring advanced logging", mlog.Err(err))
+			} else {
+				mlog.Info("Re-configured advanced logging")
+			}
+		})
+
+		// In case initLogging is called more than once.
+		if s.advancedLogListenerCleanup != nil {
+			s.advancedLogListenerCleanup()
+		}
+
+		s.advancedLogListenerCleanup = func() {
+			cfg.RemoveListener(listenerId)
+		}
+	}
+	return nil
+}
+
 const TIME_TO_WAIT_FOR_CONNECTIONS_TO_CLOSE_ON_SERVER_SHUTDOWN = time.Second
 
 func (s *Server) StopHTTPServer() {
@@ -579,7 +647,6 @@ func (s *Server) Shutdown() error {
 	defer sentry.Flush(2 * time.Second)
 
 	s.HubStop()
-	s.StopPushNotificationsHubWorkers()
 	s.ShutDownPlugins()
 	s.RemoveLicenseListener(s.licenseListenerId)
 	s.RemoveClusterLeaderChangedListener(s.clusterLeaderListenerId)
@@ -597,11 +664,18 @@ func (s *Server) Shutdown() error {
 
 	s.StopHTTPServer()
 	s.stopLocalModeServer()
+	// Push notification hub needs to be shutdown after HTTP server
+	s.StopPushNotificationsHubWorkers()
 
 	s.WaitForGoroutines()
 
 	if s.htmlTemplateWatcher != nil {
 		s.htmlTemplateWatcher.Close()
+	}
+
+	if s.advancedLogListenerCleanup != nil {
+		s.advancedLogListenerCleanup()
+		s.advancedLogListenerCleanup = nil
 	}
 
 	s.RemoveConfigListener(s.configListenerId)
@@ -631,17 +705,70 @@ func (s *Server) Shutdown() error {
 	}
 
 	if s.CacheProvider != nil {
-		s.CacheProvider.Close()
-	}
-
-	if s.CacheProvider2 != nil {
-		if err = s.CacheProvider2.Close(); err != nil {
+		if err = s.CacheProvider.Close(); err != nil {
 			mlog.Error("Unable to cleanly shutdown cache", mlog.Err(err))
 		}
 	}
 
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), time.Second*15)
+	defer timeoutCancel()
+	if err := mlog.Flush(timeoutCtx); err != nil {
+		mlog.Error("Error flushing logs", mlog.Err(err))
+	}
+
 	mlog.Info("Server stopped")
+
+	// this should just write the "server stopped" record, the rest are already flushed.
+	timeoutCtx2, timeoutCancel2 := context.WithTimeout(context.Background(), time.Second*5)
+	defer timeoutCancel2()
+	_ = mlog.ShutdownAdvancedLogging(timeoutCtx2)
+
 	return nil
+}
+
+func (s *Server) Restart() error {
+	percentage, err := s.UpgradeToE0Status()
+	if err != nil || percentage != 100 {
+		return errors.Wrap(err, "unable to restart because the system has not been upgraded")
+	}
+	s.Shutdown()
+
+	argv0, err := exec.LookPath(os.Args[0])
+	if err != nil {
+		return err
+	}
+
+	if _, err = os.Stat(argv0); err != nil {
+		return err
+	}
+
+	mlog.Info("Restarting server")
+	return syscall.Exec(argv0, os.Args, os.Environ())
+}
+
+func (s *Server) isUpgradedFromTE() bool {
+	val, err := s.Store.System().GetByName(model.SYSTEM_UPGRADED_FROM_TE_ID)
+	if err != nil {
+		return false
+	}
+	return val.Value == "true"
+}
+
+func (s *Server) CanIUpgradeToE0() error {
+	return upgrader.CanIUpgradeToE0()
+}
+
+func (s *Server) UpgradeToE0() error {
+	if err := upgrader.UpgradeToE0(); err != nil {
+		return err
+	}
+	upgradedFromTE := &model.System{Name: model.SYSTEM_UPGRADED_FROM_TE_ID, Value: "true"}
+	s.Store.System().Save(upgradedFromTE)
+	return nil
+}
+
+func (s *Server) UpgradeToE0Status() (int64, error) {
+	return upgrader.UpgradeToE0Status()
 }
 
 // Go creates a goroutine, but maintains a record of it to ensure that execution completes before
@@ -1015,6 +1142,13 @@ func runLicenseExpirationCheckJob(a *App) {
 	}, time.Hour*24)
 }
 
+func runCheckNumberOfActiveUsersWarnMetricStatusJob(a *App) {
+	doCheckNumberOfActiveUsersWarnMetricStatus(a)
+	model.CreateRecurringTask("Check Number Of Active Users Warn Metric Status", func() {
+		doCheckNumberOfActiveUsersWarnMetricStatus(a)
+	}, time.Hour*24)
+}
+
 func doSecurity(s *Server) {
 	s.DoSecurityUpdateCheck()
 }
@@ -1040,6 +1174,58 @@ const (
 
 func doSessionCleanup(s *Server) {
 	s.Store.Session().Cleanup(model.GetMillis(), SESSIONS_CLEANUP_BATCH_SIZE)
+}
+
+func doCheckNumberOfActiveUsersWarnMetricStatus(a *App) {
+	license := a.Srv().License()
+	if license != nil {
+		mlog.Debug("License is present, skip this check")
+		return
+	}
+
+	numberOfActiveUsers, err := a.Srv().Store.User().Count(model.UserCountOptions{})
+	if err != nil {
+		mlog.Error("Error to get active registered users.", mlog.Err(err))
+	}
+
+	warnMetrics := []model.WarnMetric{}
+	if numberOfActiveUsers < model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_200].Limit {
+		return
+	} else if numberOfActiveUsers >= model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_200].Limit && numberOfActiveUsers < model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_400].Limit {
+		warnMetrics = append(warnMetrics, model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_200])
+	} else if numberOfActiveUsers >= model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_400].Limit && numberOfActiveUsers < model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_500].Limit {
+		warnMetrics = append(warnMetrics, model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_400])
+	} else {
+		warnMetrics = append(warnMetrics, model.WarnMetricsTable[model.SYSTEM_WARN_METRIC_NUMBER_OF_ACTIVE_USERS_500])
+	}
+
+	for _, warnMetric := range warnMetrics {
+		data, nErr := a.Srv().Store.System().GetByName(warnMetric.Id)
+		if nErr == nil && data != nil && (data.Value == model.WARN_METRIC_STATUS_ACK || data.Value == model.WARN_METRIC_STATUS_RUNONCE) {
+			mlog.Debug("This metric warning has already been acked or should only run once")
+			continue
+		}
+
+		if nErr = a.Srv().Store.System().SaveOrUpdate(&model.System{Name: warnMetric.Id, Value: model.WARN_METRIC_STATUS_LIMIT_REACHED}); nErr != nil {
+			mlog.Error("Unable to write to database.", mlog.String("id", warnMetric.Id), mlog.Err(nErr))
+			continue
+		}
+		warnMetricStatus, _ := a.getWarnMetricStatusAndDisplayTextsForId(warnMetric.Id, nil)
+
+		if !warnMetric.IsBotOnly {
+			message := model.NewWebSocketEvent(model.WEBSOCKET_WARN_METRIC_STATUS_RECEIVED, "", "", "", nil)
+			message.Add("warnMetricStatus", warnMetricStatus.ToJson())
+			a.Publish(message)
+		}
+
+		if err = a.notifyAdminsOfWarnMetricStatus(warnMetric.Id); err != nil {
+			mlog.Error("Failed to send notifications to admin users.", mlog.Err(err))
+		}
+
+		if warnMetric.IsRunOnce {
+			a.setWarnMetricsStatusForId(warnMetric.Id, model.WARN_METRIC_STATUS_RUNONCE)
+		}
+	}
 }
 
 func doLicenseExpirationCheck(a *App) {
@@ -1161,7 +1347,7 @@ func (s *Server) stopSearchEngine() {
 }
 
 // initDiagnostics initialises the Rudder client for the diagnostics system.
-func (s *Server) initDiagnostics(endpoint string) {
+func (s *Server) initDiagnostics(endpoint string, rudderKey string) {
 	if s.rudderClient == nil {
 		config := rudder.Config{}
 		config.Logger = rudder.StdLogger(s.Log.StdLog(mlog.String("source", "rudder")))
@@ -1171,7 +1357,7 @@ func (s *Server) initDiagnostics(endpoint string) {
 			config.Verbose = true
 			config.BatchSize = 1
 		}
-		client, err := rudder.NewWithConfig(RUDDER_KEY, endpoint, config)
+		client, err := rudder.NewWithConfig(rudderKey, endpoint, config)
 		if err != nil {
 			mlog.Error("Failed to create Rudder instance", mlog.Err(err))
 			return

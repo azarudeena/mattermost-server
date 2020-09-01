@@ -150,8 +150,6 @@ func (worker *Worker) runMigration(key string, lastDone string) (bool, string, *
 	var err *model.AppError
 
 	switch key {
-	case model.MIGRATION_KEY_SIDEBAR_CATEGORIES_PHASE_2:
-		done, progress, err = worker.runSidebarCategoriesPhase2Migration(lastDone)
 	case model.MIGRATION_KEY_ADVANCED_PERMISSIONS_PHASE_2:
 		done, progress, err = worker.runAdvancedPermissionsPhase2Migration(lastDone)
 	default:
@@ -159,8 +157,8 @@ func (worker *Worker) runMigration(key string, lastDone string) (bool, string, *
 	}
 
 	if done {
-		if saveErr := worker.srv.Store.System().Save(&model.System{Name: key, Value: "true"}); saveErr != nil {
-			return false, "", saveErr
+		if nErr := worker.srv.Store.System().Save(&model.System{Name: key, Value: "true"}); nErr != nil {
+			return false, "", model.NewAppError("runMigration", "migrations.system.save.app_error", nil, nErr.Error(), http.StatusInternalServerError)
 		}
 	}
 
