@@ -45,6 +45,7 @@ func init() {
 		CHANNEL_ADMIN_ROLE_ID,
 	}, NewSystemRoleIDs...)
 
+	// When updating the values here, the values in mattermost-redux must also be updated.
 	SysconsoleAncillaryPermissions = map[string][]*Permission{
 		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id: {
 			PERMISSION_READ_PUBLIC_CHANNEL,
@@ -60,6 +61,13 @@ func init() {
 			PERMISSION_LIST_PUBLIC_TEAMS,
 			PERMISSION_VIEW_TEAM,
 		},
+		PERMISSION_SYSCONSOLE_WRITE_COMPLIANCE.Id: {
+			PERMISSION_MANAGE_JOBS,
+		},
+		PERMISSION_SYSCONSOLE_READ_COMPLIANCE.Id: {
+			PERMISSION_READ_JOBS,
+			PERMISSION_DOWNLOAD_COMPLIANCE_EXPORT_RESULT,
+		},
 		PERMISSION_SYSCONSOLE_READ_ENVIRONMENT.Id: {
 			PERMISSION_READ_JOBS,
 		},
@@ -69,10 +77,17 @@ func init() {
 		PERMISSION_SYSCONSOLE_READ_REPORTING.Id: {
 			PERMISSION_VIEW_TEAM,
 		},
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_USERS.Id: {
+			PERMISSION_EDIT_OTHER_USERS,
+			PERMISSION_DEMOTE_TO_GUEST,
+			PERMISSION_PROMOTE_GUEST,
+		},
 		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_CHANNELS.Id: {
 			PERMISSION_MANAGE_TEAM,
 			PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES,
 			PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES,
+			PERMISSION_MANAGE_PRIVATE_CHANNEL_MEMBERS,
+			PERMISSION_MANAGE_PUBLIC_CHANNEL_MEMBERS,
 			PERMISSION_DELETE_PRIVATE_CHANNEL,
 			PERMISSION_DELETE_PUBLIC_CHANNEL,
 			PERMISSION_MANAGE_CHANNEL_ROLES,
@@ -80,6 +95,7 @@ func init() {
 			PERMISSION_CONVERT_PRIVATE_CHANNEL_TO_PUBLIC,
 		},
 		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_TEAMS.Id: {
+			PERMISSION_MANAGE_TEAM,
 			PERMISSION_MANAGE_TEAM_ROLES,
 			PERMISSION_REMOVE_USER_FROM_TEAM,
 			PERMISSION_JOIN_PRIVATE_TEAMS,
@@ -124,6 +140,7 @@ func init() {
 		PERMISSION_SYSCONSOLE_READ_SITE.Id,
 		PERMISSION_SYSCONSOLE_READ_AUTHENTICATION.Id,
 		PERMISSION_SYSCONSOLE_READ_PLUGINS.Id,
+		PERMISSION_SYSCONSOLE_READ_COMPLIANCE.Id,
 		PERMISSION_SYSCONSOLE_READ_INTEGRATIONS.Id,
 		PERMISSION_SYSCONSOLE_READ_EXPERIMENTAL.Id,
 	}
@@ -268,7 +285,7 @@ func (r *Role) MergeChannelHigherScopedPermissions(higherScopedPermissions *Role
 
 		_, presentOnHigherScope := higherScopedPermissionsMap[cp.Id]
 
-		// For the channel admin role always look to the higher scope to determine if the role has ther permission.
+		// For the channel admin role always look to the higher scope to determine if the role has their permission.
 		// The channel admin is a special case because they're not part of the UI to be "channel moderated", only
 		// channel members and channel guests are.
 		if higherScopedPermissions.RoleID == CHANNEL_ADMIN_ROLE_ID && presentOnHigherScope {
@@ -465,7 +482,7 @@ func (r *Role) IsValidWithoutId() bool {
 		return false
 	}
 
-	if len(r.DisplayName) == 0 || len(r.DisplayName) > ROLE_DISPLAY_NAME_MAX_LENGTH {
+	if r.DisplayName == "" || len(r.DisplayName) > ROLE_DISPLAY_NAME_MAX_LENGTH {
 		return false
 	}
 
@@ -473,15 +490,16 @@ func (r *Role) IsValidWithoutId() bool {
 		return false
 	}
 
-	for _, permission := range r.Permissions {
-		permissionValidated := false
-		for _, p := range append(AllPermissions, DeprecatedPermissions...) {
+	check := func(perms []*Permission, permission string) bool {
+		for _, p := range perms {
 			if permission == p.Id {
-				permissionValidated = true
-				break
+				return true
 			}
 		}
-
+		return false
+	}
+	for _, permission := range r.Permissions {
+		permissionValidated := check(AllPermissions, permission) || check(DeprecatedPermissions, permission)
 		if !permissionValidated {
 			return false
 		}
@@ -508,7 +526,7 @@ func CleanRoleNames(roleNames []string) ([]string, bool) {
 }
 
 func IsValidRoleName(roleName string) bool {
-	if len(roleName) <= 0 || len(roleName) > ROLE_NAME_MAX_LENGTH {
+	if roleName == "" || len(roleName) > ROLE_NAME_MAX_LENGTH {
 		return false
 	}
 

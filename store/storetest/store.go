@@ -7,10 +7,11 @@ import (
 	"context"
 	"time"
 
+	"github.com/stretchr/testify/mock"
+
 	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/mattermost/mattermost-server/v5/store"
 	"github.com/mattermost/mattermost-server/v5/store/storetest/mocks"
-	"github.com/stretchr/testify/mock"
 )
 
 // Store can be used to provide mock stores for testing.
@@ -33,6 +34,7 @@ type Store struct {
 	LicenseStore              mocks.LicenseStore
 	TokenStore                mocks.TokenStore
 	EmojiStore                mocks.EmojiStore
+	ThreadStore               mocks.ThreadStore
 	StatusStore               mocks.StatusStore
 	FileInfoStore             mocks.FileInfoStore
 	UploadSessionStore        mocks.UploadSessionStore
@@ -72,6 +74,7 @@ func (s *Store) Preference() store.PreferenceStore                 { return &s.P
 func (s *Store) License() store.LicenseStore                       { return &s.LicenseStore }
 func (s *Store) Token() store.TokenStore                           { return &s.TokenStore }
 func (s *Store) Emoji() store.EmojiStore                           { return &s.EmojiStore }
+func (s *Store) Thread() store.ThreadStore                         { return &s.ThreadStore }
 func (s *Store) Status() store.StatusStore                         { return &s.StatusStore }
 func (s *Store) FileInfo() store.FileInfoStore                     { return &s.FileInfoStore }
 func (s *Store) UploadSession() store.UploadSessionStore           { return &s.UploadSessionStore }
@@ -93,7 +96,7 @@ func (s *Store) Close()                                { /* do nothing */ }
 func (s *Store) LockToMaster()                         { /* do nothing */ }
 func (s *Store) UnlockFromMaster()                     { /* do nothing */ }
 func (s *Store) DropAllTables()                        { /* do nothing */ }
-func (s *Store) GetDbVersion() (string, error)         { return "", nil }
+func (s *Store) GetDbVersion(bool) (string, error)     { return "", nil }
 func (s *Store) RecycleDBConnections(time.Duration)    {}
 func (s *Store) TotalMasterDbConnections() int         { return 1 }
 func (s *Store) TotalReadDbConnections() int           { return 1 }
@@ -133,6 +136,7 @@ func (s *Store) AssertExpectations(t mock.TestingT) bool {
 		&s.PluginStore,
 		&s.RoleStore,
 		&s.SchemeStore,
+		&s.ThreadStore,
 		&s.ProductNoticesStore,
 	)
 }

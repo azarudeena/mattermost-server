@@ -11,8 +11,8 @@ import (
 
 	"github.com/mattermost/mattermost-server/v5/audit"
 	"github.com/mattermost/mattermost-server/v5/config"
-	"github.com/mattermost/mattermost-server/v5/mlog"
 	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/shared/mlog"
 	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
@@ -65,7 +65,11 @@ func getConfig(c *Context, w http.ResponseWriter, r *http.Request) {
 	auditRec.Success()
 
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Write([]byte(cfg.ToJson()))
+	if c.App.Srv().License() != nil && *c.App.Srv().License().Features.Cloud {
+		w.Write([]byte(cfg.ToJsonFiltered(model.ConfigAccessTagType, model.ConfigAccessTagCloudRestrictable)))
+	} else {
+		w.Write([]byte(cfg.ToJson()))
+	}
 }
 
 func configReload(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -156,7 +160,11 @@ func updateConfig(c *Context, w http.ResponseWriter, r *http.Request) {
 	c.LogAudit("updateConfig")
 
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Write([]byte(cfg.ToJson()))
+	if c.App.Srv().License() != nil && *c.App.Srv().License().Features.Cloud {
+		w.Write([]byte(cfg.ToJsonFiltered(model.ConfigAccessTagType, model.ConfigAccessTagCloudRestrictable)))
+	} else {
+		w.Write([]byte(cfg.ToJson()))
+	}
 }
 
 func getClientConfig(c *Context, w http.ResponseWriter, r *http.Request) {
@@ -173,7 +181,7 @@ func getClientConfig(c *Context, w http.ResponseWriter, r *http.Request) {
 	}
 
 	var config map[string]string
-	if len(c.App.Session().UserId) == 0 {
+	if c.App.Session().UserId == "" {
 		config = c.App.LimitedClientConfigWithComputed()
 	} else {
 		config = c.App.ClientConfigWithComputed()
@@ -220,7 +228,10 @@ func patchConfig(c *Context, w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Do not allow plugin uploads to be toggled through the API
-	cfg.PluginSettings.EnableUploads = appCfg.PluginSettings.EnableUploads
+	if cfg.PluginSettings.EnableUploads != nil && *cfg.PluginSettings.EnableUploads != *appCfg.PluginSettings.EnableUploads {
+		c.Err = model.NewAppError("patchConfig", "api.config.update_config.not_allowed_security.app_error", map[string]interface{}{"Name": "PluginSettings.EnableUploads"}, "", http.StatusForbidden)
+		return
+	}
 
 	if cfg.MessageExportSettings.EnableExport != nil {
 		c.App.HandleMessageExportConfig(cfg, appCfg)
@@ -259,7 +270,11 @@ func patchConfig(c *Context, w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Write([]byte(cfg.ToJson()))
+	if c.App.Srv().License() != nil && *c.App.Srv().License().Features.Cloud {
+		w.Write([]byte(cfg.ToJsonFiltered(model.ConfigAccessTagType, model.ConfigAccessTagCloudRestrictable)))
+	} else {
+		w.Write([]byte(cfg.ToJson()))
+	}
 }
 
 func makeFilterConfigByPermission(accessType filterType) func(c *Context, structField reflect.StructField) bool {
@@ -285,7 +300,7 @@ func makeFilterConfigByPermission(accessType filterType) func(c *Context, struct
 				continue
 			}
 			// ConfigAccessTagWriteRestrictable trumps all other permissions
-			if tagValue == model.ConfigAccessTagWriteRestrictable {
+			if tagValue == model.ConfigAccessTagWriteRestrictable || tagValue == model.ConfigAccessTagCloudRestrictable {
 				if *c.App.Config().ExperimentalSettings.RestrictSystemAdmin && accessType == filterTypeWrite {
 					return false
 				}
@@ -300,6 +315,9 @@ func makeFilterConfigByPermission(accessType filterType) func(c *Context, struct
 				continue
 			}
 			if tagValue == model.ConfigAccessTagWriteRestrictable {
+				continue
+			}
+			if tagValue == model.ConfigAccessTagCloudRestrictable {
 				continue
 			}
 			permissionID := fmt.Sprintf("sysconsole_%s_%s", accessType, tagValue)

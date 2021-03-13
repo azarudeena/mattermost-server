@@ -236,20 +236,20 @@ func (_m *Store) GetCurrentSchemaVersion() string {
 	return r0
 }
 
-// GetDbVersion provides a mock function with given fields:
-func (_m *Store) GetDbVersion() (string, error) {
-	ret := _m.Called()
+// GetDbVersion provides a mock function with given fields: numerical
+func (_m *Store) GetDbVersion(numerical bool) (string, error) {
+	ret := _m.Called(numerical)
 
 	var r0 string
-	if rf, ok := ret.Get(0).(func() string); ok {
-		r0 = rf()
+	if rf, ok := ret.Get(0).(func(bool) string); ok {
+		r0 = rf(numerical)
 	} else {
 		r0 = ret.Get(0).(string)
 	}
 
 	var r1 error
-	if rf, ok := ret.Get(1).(func() error); ok {
-		r1 = rf()
+	if rf, ok := ret.Get(1).(func(bool) error); ok {
+		r1 = rf(numerical)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -543,6 +543,22 @@ func (_m *Store) TermsOfService() store.TermsOfServiceStore {
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(store.TermsOfServiceStore)
+		}
+	}
+
+	return r0
+}
+
+// Thread provides a mock function with given fields:
+func (_m *Store) Thread() store.ThreadStore {
+	ret := _m.Called()
+
+	var r0 store.ThreadStore
+	if rf, ok := ret.Get(0).(func() store.ThreadStore); ok {
+		r0 = rf()
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(store.ThreadStore)
 		}
 	}
 

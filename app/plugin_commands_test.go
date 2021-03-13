@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mattermost/mattermost-server/v5/model"
-	"github.com/mattermost/mattermost-server/v5/utils"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/shared/i18n"
 )
 
 func TestPluginCommand(t *testing.T) {
@@ -34,7 +35,7 @@ func TestPluginCommand(t *testing.T) {
 			}
 		})
 
-		tearDown, pluginIds, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
+		tearDown, pluginIDs, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
 			package main
 
 			import (
@@ -95,17 +96,17 @@ func TestPluginCommand(t *testing.T) {
 		require.Equal(t, model.COMMAND_RESPONSE_TYPE_EPHEMERAL, resp.ResponseType)
 		require.Equal(t, "text", resp.Text)
 
-		err2 := th.App.DisablePlugin(pluginIds[0])
+		err2 := th.App.DisablePlugin(pluginIDs[0])
 		require.Nil(t, err2)
 
-		commands, err3 := th.App.ListAutocompleteCommands(args.TeamId, utils.T)
+		commands, err3 := th.App.ListAutocompleteCommands(args.TeamId, i18n.T)
 		require.Nil(t, err3)
 
 		for _, commands := range commands {
 			require.NotEqual(t, "plugin", commands.Trigger)
 		}
 
-		th.App.RemovePlugin(pluginIds[0])
+		th.App.RemovePlugin(pluginIDs[0])
 	})
 
 	t.Run("re-entrant command registration on config change", func(t *testing.T) {
@@ -115,7 +116,7 @@ func TestPluginCommand(t *testing.T) {
 			}
 		})
 
-		tearDown, pluginIds, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
+		tearDown, pluginIDs, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
 			package main
 
 			import (
@@ -206,7 +207,7 @@ func TestPluginCommand(t *testing.T) {
 			killed = true
 		}
 
-		th.App.RemovePlugin(pluginIds[0])
+		th.App.RemovePlugin(pluginIDs[0])
 		require.False(t, killed, "execute command appears to have deadlocked")
 	})
 
@@ -222,7 +223,7 @@ func TestPluginCommand(t *testing.T) {
 			}
 		})
 
-		tearDown, pluginIds, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
+		tearDown, pluginIDs, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
 			package main
 
 			import (
@@ -284,6 +285,96 @@ func TestPluginCommand(t *testing.T) {
 		require.Equal(t, model.COMMAND_RESPONSE_TYPE_EPHEMERAL, resp.ResponseType)
 		require.Equal(t, "text", resp.Text)
 
-		th.App.RemovePlugin(pluginIds[0])
+		th.App.RemovePlugin(pluginIDs[0])
 	})
+	t.Run("plugin has crashed before execution of command", func(t *testing.T) {
+		tearDown, pluginIDs, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
+			package main
+
+			import (
+				"github.com/mattermost/mattermost-server/v5/plugin"
+				"github.com/mattermost/mattermost-server/v5/model"
+			)
+
+			type MyPlugin struct {
+				plugin.MattermostPlugin
+
+			}
+
+			func (p *MyPlugin) OnActivate() error {
+				err := p.API.RegisterCommand(&model.Command{
+					Trigger: "code",
+				})
+				if err != nil {
+					p.API.LogError("error", "err", err)
+				}
+				panic("Uncaught Error")
+
+				return err
+			}
+
+			func (p *MyPlugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
+				return &model.CommandResponse{}, nil
+			}
+
+			func main() {
+				plugin.ClientMain(&MyPlugin{})
+			}
+		`}, th.App, th.App.NewPluginAPI)
+		defer tearDown()
+		require.Len(t, activationErrors, 1)
+		require.Nil(t, nil, activationErrors[0])
+		args.Command = "/code"
+		resp, err := th.App.ExecuteCommand(args)
+		require.Nil(t, resp)
+		require.NotNil(t, err)
+		require.Equal(t, err.Id, "model.plugin_command_error.error.app_error")
+		th.App.RemovePlugin(pluginIDs[0])
+	})
+
+	t.Run("plugin has crashed due to the execution of the command", func(t *testing.T) {
+		tearDown, pluginIDs, activationErrors := SetAppEnvironmentWithPlugins(t, []string{`
+			package main
+
+			import (
+				"github.com/mattermost/mattermost-server/v5/plugin"
+				"github.com/mattermost/mattermost-server/v5/model"
+			)
+
+			type MyPlugin struct {
+				plugin.MattermostPlugin
+
+			}
+
+			func (p *MyPlugin) OnActivate() error {
+				err := p.API.RegisterCommand(&model.Command{
+					Trigger: "code",
+				})
+				if err != nil {
+					p.API.LogError("error", "err", err)
+				}
+
+				return err
+			}
+
+			func (p *MyPlugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
+				panic("Uncaught Error")
+				return &model.CommandResponse{}, nil
+			}
+
+			func main() {
+				plugin.ClientMain(&MyPlugin{})
+			}
+		`}, th.App, th.App.NewPluginAPI)
+		defer tearDown()
+		require.Len(t, activationErrors, 1)
+		require.Nil(t, nil, activationErrors[0])
+		args.Command = "/code"
+		resp, err := th.App.ExecuteCommand(args)
+		require.Nil(t, resp)
+		require.NotNil(t, err)
+		require.Equal(t, err.Id, "model.plugin_command_crash.error.app_error")
+		th.App.RemovePlugin(pluginIDs[0])
+	})
+
 }

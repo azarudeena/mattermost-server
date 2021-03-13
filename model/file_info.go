@@ -4,14 +4,20 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"image"
 	"image/gif"
+	"image/jpeg"
 	"io"
 	"mime"
 	"net/http"
 	"path/filepath"
 	"strings"
+
+	"github.com/disintegration/imaging"
+
+	"github.com/mattermost/mattermost-server/v5/shared/mlog"
 )
 
 const (
@@ -36,22 +42,24 @@ type GetFileInfosOptions struct {
 }
 
 type FileInfo struct {
-	Id              string `json:"id"`
-	CreatorId       string `json:"user_id"`
-	PostId          string `json:"post_id,omitempty"`
-	CreateAt        int64  `json:"create_at"`
-	UpdateAt        int64  `json:"update_at"`
-	DeleteAt        int64  `json:"delete_at"`
-	Path            string `json:"-"` // not sent back to the client
-	ThumbnailPath   string `json:"-"` // not sent back to the client
-	PreviewPath     string `json:"-"` // not sent back to the client
-	Name            string `json:"name"`
-	Extension       string `json:"extension"`
-	Size            int64  `json:"size"`
-	MimeType        string `json:"mime_type"`
-	Width           int    `json:"width,omitempty"`
-	Height          int    `json:"height,omitempty"`
-	HasPreviewImage bool   `json:"has_preview_image,omitempty"`
+	Id              string  `json:"id"`
+	CreatorId       string  `json:"user_id"`
+	PostId          string  `json:"post_id,omitempty"`
+	CreateAt        int64   `json:"create_at"`
+	UpdateAt        int64   `json:"update_at"`
+	DeleteAt        int64   `json:"delete_at"`
+	Path            string  `json:"-"` // not sent back to the client
+	ThumbnailPath   string  `json:"-"` // not sent back to the client
+	PreviewPath     string  `json:"-"` // not sent back to the client
+	Name            string  `json:"name"`
+	Extension       string  `json:"extension"`
+	Size            int64   `json:"size"`
+	MimeType        string  `json:"mime_type"`
+	Width           int     `json:"width,omitempty"`
+	Height          int     `json:"height,omitempty"`
+	HasPreviewImage bool    `json:"has_preview_image,omitempty"`
+	MiniPreview     *[]byte `json:"mini_preview"` // declared as *[]byte to avoid postgres/mysql differences in deserialization
+	Content         string  `json:"-"`
 }
 
 func (fi *FileInfo) ToJson() string {
@@ -65,9 +73,8 @@ func FileInfoFromJson(data io.Reader) *FileInfo {
 	var fi FileInfo
 	if err := decoder.Decode(&fi); err != nil {
 		return nil
-	} else {
-		return &fi
 	}
+	return &fi
 }
 
 func FileInfosToJson(infos []*FileInfo) string {
@@ -81,9 +88,8 @@ func FileInfosFromJson(data io.Reader) []*FileInfo {
 	var infos []*FileInfo
 	if err := decoder.Decode(&infos); err != nil {
 		return nil
-	} else {
-		return infos
 	}
+	return infos
 }
 
 func (fi *FileInfo) PreSave() {
@@ -109,7 +115,7 @@ func (fi *FileInfo) IsValid() *AppError {
 		return NewAppError("FileInfo.IsValid", "model.file_info.is_valid.user_id.app_error", nil, "id="+fi.Id, http.StatusBadRequest)
 	}
 
-	if len(fi.PostId) != 0 && !IsValidId(fi.PostId) {
+	if fi.PostId != "" && !IsValidId(fi.PostId) {
 		return NewAppError("FileInfo.IsValid", "model.file_info.is_valid.post_id.app_error", nil, "id="+fi.Id, http.StatusBadRequest)
 	}
 
@@ -150,6 +156,19 @@ func NewInfo(name string) *FileInfo {
 	return info
 }
 
+func GenerateMiniPreviewImage(img image.Image) *[]byte {
+	preview := imaging.Resize(img, 16, 16, imaging.Lanczos)
+
+	buf := new(bytes.Buffer)
+
+	if err := jpeg.Encode(buf, preview, &jpeg.Options{Quality: 90}); err != nil {
+		mlog.Info("Unable to encode image as mini preview jpg", mlog.Err(err))
+		return nil
+	}
+	data := buf.Bytes()
+	return &data
+}
+
 func GetInfoForBytes(name string, data io.ReadSeeker, size int) (*FileInfo, *AppError) {
 	info := &FileInfo{
 		Name: name,
@@ -176,13 +195,13 @@ func GetInfoForBytes(name string, data io.ReadSeeker, size int) (*FileInfo, *App
 			if info.MimeType == "image/gif" {
 				// Just show the gif itself instead of a preview image for animated gifs
 				data.Seek(0, io.SeekStart)
-				if gifConfig, err := gif.DecodeAll(data); err != nil {
+				gifConfig, err := gif.DecodeAll(data)
+				if err != nil {
 					// Still return the rest of the info even though it doesn't appear to be an actual gif
 					info.HasPreviewImage = true
 					return info, NewAppError("GetInfoForBytes", "model.file_info.get.gif.app_error", nil, err.Error(), http.StatusBadRequest)
-				} else {
-					info.HasPreviewImage = len(gifConfig.Image) == 1
 				}
+				info.HasPreviewImage = len(gifConfig.Image) == 1
 			} else {
 				info.HasPreviewImage = true
 			}
